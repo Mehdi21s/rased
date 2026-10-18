@@ -1,3 +1,4 @@
-aiogram>=3.13,<4.0
-Telethon>=1.36,<2.0
-deep-translator>=1.11.4,<2.0
+aiogram>=3.4,<4
+Telethon>=1.34,<2
+deep-translator>=1.11,<2
+PySocks>=1.7,<2
