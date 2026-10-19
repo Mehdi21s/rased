@@ -1,210 +1,168 @@
-import asyncio, json, logging, os, re, tempfile, urllib.request, urllib.error
+import os
+import re
+import json
+import asyncio
+import logging
+import hashlib
 from pathlib import Path
-from typing import Optional
+from datetime import datetime, timezone
 
 from aiogram import Bot
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from deep_translator import GoogleTranslator
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 log = logging.getLogger("news-translator")
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-SOURCE_CHANNELS = [x.strip().lstrip("@") for x in os.getenv("SOURCE_CHANNELS", "HoopoeAr,kataebAlqasam").split(",") if x.strip()]
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@rasedpersian")
-CATCHUP_LIMIT = max(0, int(os.getenv("CATCHUP_LIMIT", "20")))
-TRANSLATE_REQUIRED = os.getenv("TRANSLATE_REQUIRED", "true").lower() not in {"0", "false", "no", "off"}
+API_ID = int(os.getenv("API_ID", "0").strip() or "0")
+API_HASH = os.getenv("API_HASH", "").strip()
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "@HoopoeAr").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@rasedpersian").strip()
+POLL_INTERVAL = max(30, int(os.getenv("POLL_INTERVAL", "60")))
+
+if not API_ID or not API_HASH or not SESSION_STRING or not BOT_TOKEN:
+    missing = [name for name, value in {
+        "API_ID": API_ID,
+        "API_HASH": API_HASH,
+        "SESSION_STRING": SESSION_STRING,
+        "BOT_TOKEN": BOT_TOKEN,
+    }.items() if not value]
+    raise RuntimeError("Missing Railway Variables: " + ", ".join(missing))
+
+# Railway's filesystem may be ephemeral; mount a volume and set DATA_DIR to its mount path
+# if you need the deduplication database to persist across redeploys.
 DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/news-translator"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_posts.json"
 
-proxy = None
-if os.getenv("PROXY_HOST") and os.getenv("PROXY_PORT"):
-    proxy = ("socks5", os.getenv("PROXY_HOST"), int(os.getenv("PROXY_PORT")))
+try:
+    seen_posts = set(json.loads(SEEN_FILE.read_text("utf-8")))
+except (OSError, ValueError, TypeError):
+    seen_posts = set()
 
-bot = Bot(token=BOT_TOKEN)
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, proxy=proxy)
-LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://libretranslate.railway.internal:5000/translate")
-LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "")
-seen_ids = set()
+seen_lock = asyncio.Lock()
 
-def load_seen():
-    global seen_ids
-    try:
-        if SEEN_FILE.exists():
-            seen_ids = {str(x) for x in json.loads(SEEN_FILE.read_text(encoding="utf-8"))}
-    except Exception:
-        log.exception("Could not load seen post IDs")
 
 def save_seen():
-    try:
-        SEEN_FILE.write_text(json.dumps(sorted(seen_ids)), encoding="utf-8")
-    except Exception:
-        log.exception("Could not save seen post IDs")
+    tmp = SEEN_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(seen_posts), ensure_ascii=False), "utf-8")
+    tmp.replace(SEEN_FILE)
 
-def clean_text(text: Optional[str]) -> str:
-    if not text:
+
+def post_key(message):
+    raw = f"{message.chat_id}:{message.id}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def translate_text(text: str) -> str:
+    """Translate Arabic to Persian; preserve the original if translation fails."""
+    if not text or not text.strip():
         return ""
-    lines = []
-    for line in text.splitlines():
-        if re.search(r"(?:منبع|source)\s*[:：]", line, re.I):
+    # Translate in chunks to stay below common translation-service limits.
+    chunks = re.split(r"(\n+)", text)
+    out = []
+    translator = GoogleTranslator(source="auto", target="fa")
+    for chunk in chunks:
+        if not chunk or chunk.isspace():
+            out.append(chunk)
             continue
-        if re.search(r"https?://t\.me/(?:HoopoeAr|rasedpersian)\b", line, re.I):
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
-
-def split_text(text: str, limit: int = 4000):
-    text = text.strip()
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = text.rfind(" ", 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        yield text[:cut].strip()
-        text = text[cut:].strip()
-    if text:
-        yield text
-
-def _libretranslate_request(text: str) -> str:
-    payload = {
-        "q": text,
-        "source": "auto",
-        "target": "fa",
-        "format": "text",
-    }
-    if LIBRETRANSLATE_API_KEY:
-        payload["api_key"] = LIBRETRANSLATE_API_KEY
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        LIBRETRANSLATE_URL,
-        data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=45) as response:
-        body = json.loads(response.read().decode("utf-8"))
-    return body.get("translatedText", "")
+        if len(chunk) <= 4500:
+            out.append(translator.translate(chunk) or chunk)
+        else:
+            pieces = [chunk[i:i + 4000] for i in range(0, len(chunk), 4000)]
+            out.extend(translator.translate(piece) or piece for piece in pieces)
+    return "".join(out)
 
 
-async def translate_text(text: str) -> str:
-    text = clean_text(text)
-    if not text:
-        return ""
-    last_error = None
-    for attempt in range(5):
-        try:
-            result = await asyncio.to_thread(_libretranslate_request, text)
-            result = clean_text(result or "")
-            if not result and TRANSLATE_REQUIRED:
-                raise RuntimeError("LibreTranslate returned an empty result")
-            return result
-        except Exception as exc:
-            last_error = exc
-            if attempt < 4:
-                wait_seconds = min(2 ** attempt, 16)
-                log.warning("LibreTranslate attempt %s/5 failed; retrying in %s seconds: %s",
-                            attempt + 1, wait_seconds, exc)
-                await asyncio.sleep(wait_seconds)
-    raise RuntimeError(f"LibreTranslate failed after 5 attempts: {last_error}") from last_error
+def append_source(text: str, source_url: str) -> str:
+    text = (text or "").strip()
+    footer = f"\n\n📰 منبع: {source_url}" if source_url else ""
+    return (text + footer).strip()
 
-async def send_translated_message(message, source_key: str):
-    post_key = f"{source_key}:{message.id}"
-    if post_key in seen_ids or str(message.id) in seen_ids:
-        return
-    original = clean_text(message.message or "")
-    translated = ""
-    if original:
-        try:
-            translated = await translate_text(original)
-        except Exception:
-            log.exception("Translation failed for message %s", message.id)
-            if TRANSLATE_REQUIRED:
-                return
-            translated = original
-
-    caption = translated[:1024] if translated else None
-    remainder = translated[1024:].strip() if len(translated) > 1024 else ""
-    media_path = None
-    try:
-        if message.media:
-            suffix = ""
-            mime = (getattr(message.file, "mime_type", "") or "").lower() if message.file else ""
-            suffix = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
-                       "video/mp4": ".mp4", "audio/mpeg": ".mp3", "audio/ogg": ".ogg" }.get(mime, "")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                media_path = tmp.name
-            downloaded = await message.download_media(file=media_path)
-            if downloaded:
-                handle = open(downloaded, "rb")
-                try:
-                    if mime.startswith("image/"):
-                        await bot.send_photo(TARGET_CHANNEL, photo=handle, caption=caption)
-                    elif mime.startswith("video/"):
-                        await bot.send_video(TARGET_CHANNEL, video=handle, caption=caption, supports_streaming=True)
-                    elif mime.startswith("audio/"):
-                        await bot.send_audio(TARGET_CHANNEL, audio=handle, caption=caption)
-                    else:
-                        await bot.send_document(TARGET_CHANNEL, document=handle, caption=caption)
-                finally:
-                    handle.close()
-            elif translated:
-                for chunk in split_text(translated):
-                    await bot.send_message(TARGET_CHANNEL, chunk)
-        elif translated:
-            for chunk in split_text(translated):
-                await bot.send_message(TARGET_CHANNEL, chunk)
-
-        if remainder:
-            for chunk in split_text(remainder):
-                await bot.send_message(TARGET_CHANNEL, chunk)
-        seen_ids.add(post_key)
-        save_seen()
-        log.info("Relayed message %s without source footer", message.id)
-    except Exception:
-        log.exception("Failed to relay message %s", message.id)
-    finally:
-        if media_path:
-            try:
-                Path(media_path).unlink(missing_ok=True)
-            except Exception:
-                pass
 
 async def main():
-    load_seen()
+    bot = Bot(BOT_TOKEN)
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
-    me = await client.get_me()
-    log.info("Telethon connected as %s", getattr(me, "username", None) or me.id)
-    sources = []
-    for source_name in SOURCE_CHANNELS:
+
+    try:
+        source = await client.get_entity(SOURCE_CHANNEL)
+        # Validate bot access to the destination before listening.
         try:
-            entity = await client.get_entity(source_name)
-            sources.append((source_name, entity))
-            log.info("Watching @%s -> %s", source_name, TARGET_CHANNEL)
-        except Exception:
-            log.exception("Could not access source channel @%s", source_name)
+            await bot.get_chat(TARGET_CHANNEL)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Bot cannot access target {TARGET_CHANNEL}. Add the bot as an admin with permission to post."
+            ) from exc
 
-    if not sources:
-        raise RuntimeError("No source channels could be opened. Check SOURCE_CHANNELS and account membership.")
+        log.info("Listening for new posts from %s; publishing to %s", SOURCE_CHANNEL, TARGET_CHANNEL)
 
-    source_entities = [entity for _, entity in sources]
+        async def publish_message(message):
+            key = post_key(message)
+            async with seen_lock:
+                if key in seen_posts:
+                    return
+                # Reserve before sending to avoid duplicate concurrent processing.
+                seen_posts.add(key)
+                save_seen()
 
-    @client.on(events.NewMessage(chats=source_entities))
-    async def on_new_message(event):
-        await send_translated_message(event.message, str(event.chat_id))
+            source_url = f"https://t.me/{SOURCE_CHANNEL.lstrip('@')}/{message.id}" if SOURCE_CHANNEL.startswith("@") else ""
+            original = message.message or ""
+            try:
+                translated = await asyncio.to_thread(translate_text, original)
+            except Exception:
+                log.exception("Translation failed for source post %s; keeping original text", message.id)
+                translated = original
 
-    if CATCHUP_LIMIT:
-        for source_name, source in sources:
-            source_key = str(getattr(source, "id", source_name))
-            for message in reversed(await client.get_messages(source, limit=CATCHUP_LIMIT)):
-                post_key = f"{source_key}:{message.id}"
-                if post_key not in seen_ids and str(message.id) not in seen_ids:
-                    await send_translated_message(message, source_key)
-    await client.run_until_disconnected()
+            caption = append_source(translated, source_url)
+            try:
+                if message.media:
+                    # Download and re-upload media so the target post is independent of source forwarding.
+                    media_path = await message.download_media(file=str(DATA_DIR))
+                    if media_path:
+                        try:
+                            if caption:
+                                await bot.send_document(TARGET_CHANNEL, document=__import__('aiogram').types.FSInputFile(media_path), caption=caption[:1024])
+                            else:
+                                await bot.send_document(TARGET_CHANNEL, document=__import__('aiogram').types.FSInputFile(media_path))
+                            # For common image/video files, send as photo/video instead of document.
+                            # The document fallback above keeps file quality and supports most media types.
+                        finally:
+                            try:
+                                os.remove(media_path)
+                            except OSError:
+                                pass
+                    elif caption:
+                        await bot.send_message(TARGET_CHANNEL, caption[:4096])
+                elif caption:
+                    await bot.send_message(TARGET_CHANNEL, caption[:4096], disable_web_page_preview=False)
+            except Exception:
+                async with seen_lock:
+                    seen_posts.discard(key)
+                    save_seen()
+                log.exception("Publishing failed for source post %s", message.id)
+
+        @client.on(events.NewMessage(chats=source))
+        async def on_new_message(event):
+            # Telegram albums arrive as separate messages; each item is preserved as a post.
+            await publish_message(event.message)
+
+        # Catch up on a small recent window after restarts; deduplication prevents repeats.
+        async for message in client.iter_messages(source, limit=20, reverse=True):
+            if message.date and (datetime.now(timezone.utc) - message.date.replace(tzinfo=timezone.utc)).total_seconds() < 24 * 3600:
+                await publish_message(message)
+
+        await client.run_until_disconnected()
+    finally:
+        await client.disconnect()
+        await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
