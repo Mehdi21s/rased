@@ -14,7 +14,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "HoopoeAr").lstrip("@")
+SOURCE_CHANNELS = [x.strip().lstrip("@") for x in os.getenv("SOURCE_CHANNELS", "HoopoeAr,kataebAlqasam").split(",") if x.strip()]
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@rasedpersian")
 CATCHUP_LIMIT = max(0, int(os.getenv("CATCHUP_LIMIT", "20")))
 TRANSLATE_REQUIRED = os.getenv("TRANSLATE_REQUIRED", "true").lower() not in {"0", "false", "no", "off"}
@@ -35,7 +35,7 @@ def load_seen():
     global seen_ids
     try:
         if SEEN_FILE.exists():
-            seen_ids = {int(x) for x in json.loads(SEEN_FILE.read_text(encoding="utf-8"))}
+            seen_ids = {str(x) for x in json.loads(SEEN_FILE.read_text(encoding="utf-8"))}
     except Exception:
         log.exception("Could not load seen post IDs")
 
@@ -80,8 +80,9 @@ async def translate_text(text: str) -> str:
         raise RuntimeError("Translation returned an empty result")
     return result
 
-async def send_translated_message(message):
-    if message.id in seen_ids:
+async def send_translated_message(message, source_key: str):
+    post_key = f"{source_key}:{message.id}"
+    if post_key in seen_ids or str(message.id) in seen_ids:
         return
     original = clean_text(message.message or "")
     translated = ""
@@ -129,7 +130,7 @@ async def send_translated_message(message):
         if remainder:
             for chunk in split_text(remainder):
                 await bot.send_message(TARGET_CHANNEL, chunk)
-        seen_ids.add(message.id)
+        seen_ids.add(post_key)
         save_seen()
         log.info("Relayed message %s without source footer", message.id)
     except Exception:
@@ -146,17 +147,31 @@ async def main():
     await client.start()
     me = await client.get_me()
     log.info("Telethon connected as %s", getattr(me, "username", None) or me.id)
-    source = await client.get_entity(SOURCE_CHANNEL)
-    log.info("Watching @%s -> %s", SOURCE_CHANNEL, TARGET_CHANNEL)
+    sources = []
+    for source_name in SOURCE_CHANNELS:
+        try:
+            entity = await client.get_entity(source_name)
+            sources.append((source_name, entity))
+            log.info("Watching @%s -> %s", source_name, TARGET_CHANNEL)
+        except Exception:
+            log.exception("Could not access source channel @%s", source_name)
 
-    @client.on(events.NewMessage(chats=source))
+    if not sources:
+        raise RuntimeError("No source channels could be opened. Check SOURCE_CHANNELS and account membership.")
+
+    source_entities = [entity for _, entity in sources]
+
+    @client.on(events.NewMessage(chats=source_entities))
     async def on_new_message(event):
-        await send_translated_message(event.message)
+        await send_translated_message(event.message, str(event.chat_id))
 
     if CATCHUP_LIMIT:
-        for message in reversed(await client.get_messages(source, limit=CATCHUP_LIMIT)):
-            if message.id not in seen_ids:
-                await send_translated_message(message)
+        for source_name, source in sources:
+            source_key = str(getattr(source, "id", source_name))
+            for message in reversed(await client.get_messages(source, limit=CATCHUP_LIMIT)):
+                post_key = f"{source_key}:{message.id}"
+                if post_key not in seen_ids and str(message.id) not in seen_ids:
+                    await send_translated_message(message, source_key)
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
