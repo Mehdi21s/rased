@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional
 
 from aiogram import Bot
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -188,6 +188,86 @@ async def send_translated_message(message, source_key: str):
             except Exception:
                 pass
 
+async def send_translated_album(messages, source_key: str):
+    """Send a Telegram media group as one album, with translated caption on the first item."""
+    if not messages:
+        return
+    messages = sorted(messages, key=lambda item: item.id)
+    album_key = f"{source_key}:album:{messages[0].grouped_id or messages[0].id}"
+    if album_key in seen_ids:
+        return
+
+    original = ""
+    for item in messages:
+        if item.message:
+            original = clean_text(item.message)
+            if original:
+                break
+    translated = ""
+    if original:
+        try:
+            translated = await translate_text(original)
+        except Exception:
+            log.exception("Album translation failed for %s", album_key)
+            if TRANSLATE_REQUIRED:
+                return
+
+    media_items = []
+    paths = []
+    try:
+        for index, item in enumerate(messages):
+            if not item.media:
+                continue
+            mime = (getattr(item.file, "mime_type", "") or "").lower() if item.file else ""
+            suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "video/mp4": ".mp4"}.get(mime, ".bin")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                path = tmp.name
+            paths.append(path)
+            downloaded = await item.download_media(file=path)
+            if not downloaded:
+                continue
+            upload = FSInputFile(downloaded)
+            caption = translated[:1024] if index == 0 and translated else None
+            if mime.startswith("video/"):
+                media_items.append(InputMediaVideo(media=upload, caption=caption, supports_streaming=True))
+            elif mime.startswith("image/"):
+                media_items.append(InputMediaPhoto(media=upload, caption=caption))
+            else:
+                media_items.append(InputMediaDocument(media=upload, caption=caption))
+
+        if len(media_items) >= 2:
+            await bot.send_media_group(TARGET_CHANNEL, media=media_items)
+        elif len(media_items) == 1:
+            only = media_items[0]
+            if isinstance(only, InputMediaVideo):
+                await bot.send_video(TARGET_CHANNEL, video=only.media, caption=only.caption, supports_streaming=True)
+            elif isinstance(only, InputMediaPhoto):
+                await bot.send_photo(TARGET_CHANNEL, photo=only.media, caption=only.caption)
+            else:
+                await bot.send_document(TARGET_CHANNEL, document=only.media, caption=only.caption)
+        elif translated:
+            for chunk in split_text(translated):
+                await bot.send_message(TARGET_CHANNEL, chunk)
+
+        remainder = translated[1024:].strip() if len(translated) > 1024 else ""
+        if remainder:
+            for chunk in split_text(remainder):
+                await bot.send_message(TARGET_CHANNEL, chunk)
+        seen_ids.add(album_key)
+        for item in messages:
+            seen_ids.add(f"{source_key}:{item.id}")
+        save_seen()
+        log.info("Relayed album %s (%s items)", album_key, len(media_items))
+    except Exception:
+        log.exception("Failed to relay album %s", album_key)
+    finally:
+        for path in paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 async def main():
     load_seen()
     await client.start()
@@ -208,8 +288,16 @@ async def main():
     source_entities = [entity for _, entity in sources]
     log.info("Active source channels (%s): %s", len(sources), ", ".join("@" + name for name, _ in sources))
 
+    @client.on(events.Album(chats=source_entities))
+    async def on_album(event):
+        await send_translated_album(event.messages, str(event.chat_id))
+
     @client.on(events.NewMessage(chats=source_entities))
     async def on_new_message(event):
+        # Telegram sends each album item as a NewMessage too; the Album handler
+        # publishes the group together, so skip individual album items here.
+        if getattr(event.message, "grouped_id", None):
+            return
         await send_translated_message(event.message, str(event.chat_id))
 
     if CATCHUP_LIMIT:
