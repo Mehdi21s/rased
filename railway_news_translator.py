@@ -1,9 +1,8 @@
-import asyncio, json, logging, os, re, tempfile
+import asyncio, json, logging, os, re, tempfile, urllib.request, urllib.error
 from pathlib import Path
 from typing import Optional
 
 from aiogram import Bot
-from deep_translator import GoogleTranslator
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -28,7 +27,8 @@ if os.getenv("PROXY_HOST") and os.getenv("PROXY_PORT"):
 
 bot = Bot(token=BOT_TOKEN)
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, proxy=proxy)
-translator = GoogleTranslator(source="auto", target="fa")
+LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://libretranslate.railway.internal:5000/translate")
+LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "")
 seen_ids = set()
 
 def load_seen():
@@ -70,15 +70,47 @@ def split_text(text: str, limit: int = 4000):
     if text:
         yield text
 
+def _libretranslate_request(text: str) -> str:
+    payload = {
+        "q": text,
+        "source": "auto",
+        "target": "fa",
+        "format": "text",
+    }
+    if LIBRETRANSLATE_API_KEY:
+        payload["api_key"] = LIBRETRANSLATE_API_KEY
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        LIBRETRANSLATE_URL,
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    return body.get("translatedText", "")
+
+
 async def translate_text(text: str) -> str:
     text = clean_text(text)
     if not text:
         return ""
-    result = await asyncio.to_thread(translator.translate, text)
-    result = clean_text(result or "")
-    if not result and TRANSLATE_REQUIRED:
-        raise RuntimeError("Translation returned an empty result")
-    return result
+    last_error = None
+    for attempt in range(5):
+        try:
+            result = await asyncio.to_thread(_libretranslate_request, text)
+            result = clean_text(result or "")
+            if not result and TRANSLATE_REQUIRED:
+                raise RuntimeError("LibreTranslate returned an empty result")
+            return result
+        except Exception as exc:
+            last_error = exc
+            if attempt < 4:
+                wait_seconds = min(2 ** attempt, 16)
+                log.warning("LibreTranslate attempt %s/5 failed; retrying in %s seconds: %s",
+                            attempt + 1, wait_seconds, exc)
+                await asyncio.sleep(wait_seconds)
+    raise RuntimeError(f"LibreTranslate failed after 5 attempts: {last_error}") from last_error
 
 async def send_translated_message(message, source_key: str):
     post_key = f"{source_key}:{message.id}"
