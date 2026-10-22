@@ -1,4 +1,4 @@
-import asyncio, json, logging, os, re, tempfile, urllib.request, urllib.error
+import asyncio, json, logging, os, re, tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -10,19 +10,19 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("news-translator")
+log = logging.getLogger("persian-relay")
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-SOURCE_CHANNELS = list(dict.fromkeys(x.strip().lstrip("@").strip() for x in os.getenv("SOURCE_CHANNELS", "HoopoeAr,kataebAlqasam").split(",") if x.strip()))
-REQUIRED_SOURCES = {"HoopoeAr", "kataebAlqasam"}
-STARTUP_MARKER = "RASED_TWO_SOURCE_FIX_V3"
+SOURCE_CHANNELS = list(dict.fromkeys(x.strip().lstrip("@").strip() for x in os.getenv("SOURCE_CHANNELS", "kataebAlqasam,Ali_bk_8").replace(";", ",").split(",") if x.strip()))
+REQUIRED_SOURCES = {"kataebAlqasam", "Ali_bk_8"}
+STARTUP_MARKER = "RASED_PERSIAN_ONLY_RELAY_V1"
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@rasedpersian")
 CATCHUP_LIMIT = max(0, int(os.getenv("CATCHUP_LIMIT", "0")))
-TRANSLATE_REQUIRED = os.getenv("TRANSLATE_REQUIRED", "true").lower() not in {"0", "false", "no", "off"}
-DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/news-translator"))
+TRANSLATE_REQUIRED = False  # Kept for backwards compatibility; translation is disabled.
+DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/persian-relay"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_posts.json"
 
@@ -32,8 +32,6 @@ if os.getenv("PROXY_HOST") and os.getenv("PROXY_PORT"):
 
 bot = Bot(token=BOT_TOKEN)
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, proxy=proxy)
-LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://libretranslate.railway.internal:5000/translate")
-LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "")
 # Caption footer. Set POST_TAG in Railway Variables to customize it.
 POST_TAG = os.getenv("POST_TAG", "✨ @rasedpersian ✨").strip()
 # Optional Telegram custom-emoji document ID. Leave empty until the ID is known.
@@ -103,17 +101,46 @@ def remove_emojis(text: str) -> str:
 
 
 def clean_text(text: Optional[str]) -> str:
+    """Clean source/footer noise without stripping Persian text or emojis."""
     if not text:
         return ""
-    text = remove_emojis(text)
     lines = []
     for line in text.splitlines():
         if re.search(r"(?:منبع|source)\s*[:：]", line, re.I):
             continue
-        if re.search(r"https?://t\.me/(?:HoopoeAr|rasedpersian)\b", line, re.I):
+        if re.search(r"https?://t\.me/(?:HoopoeAr|kataebAlqasam|Ali_bk_8|rasedpersian)\b", line, re.I):
             continue
-        lines.append(line)
+        lines.append(line.rstrip())
     return "\n".join(lines).strip()
+
+
+def extract_persian_text(text: Optional[str]) -> str:
+    """Keep the Persian section and discard the English translation below it.
+
+    Stops at a clearly English-only line/paragraph or common translation heading.
+    Mixed-script lines containing Persian are retained to avoid losing names/URLs.
+    """
+    text = clean_text(text)
+    if not text:
+        return ""
+    output = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            output.append("")
+            continue
+        if re.match(r"^(?:english(?: translation)?|translation|translated into english)\s*[:：-]?\s*$", stripped, re.I):
+            break
+        persian_count = len(re.findall(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", stripped))
+        latin_count = len(re.findall(r"[A-Za-z]", stripped))
+        # A Latin-only line after the Persian section is likely the English version.
+        if latin_count >= 8 and persian_count == 0:
+            break
+        # Explicit separator followed by an English translation.
+        if re.match(r"^(?:[-_=]{3,}|\*{3,})\s*$", stripped) and output:
+            break
+        output.append(line)
+    return "\n".join(output).strip()
 
 def split_text(text: str, limit: int = 4000):
     text = text.strip()
@@ -128,47 +155,6 @@ def split_text(text: str, limit: int = 4000):
     if text:
         yield text
 
-def _libretranslate_request(text: str) -> str:
-    payload = {
-        "q": text,
-        "source": "auto",
-        "target": "fa",
-        "format": "text",
-    }
-    if LIBRETRANSLATE_API_KEY:
-        payload["api_key"] = LIBRETRANSLATE_API_KEY
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        LIBRETRANSLATE_URL,
-        data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=45) as response:
-        body = json.loads(response.read().decode("utf-8"))
-    return body.get("translatedText", "")
-
-
-async def translate_text(text: str) -> str:
-    text = clean_text(text)
-    if not text:
-        return ""
-    last_error = None
-    for attempt in range(5):
-        try:
-            result = await asyncio.to_thread(_libretranslate_request, text)
-            result = clean_text(result or "")
-            if not result and TRANSLATE_REQUIRED:
-                raise RuntimeError("LibreTranslate returned an empty result")
-            return result
-        except Exception as exc:
-            last_error = exc
-            if attempt < 4:
-                wait_seconds = min(2 ** attempt, 16)
-                log.warning("LibreTranslate attempt %s/5 failed; retrying in %s seconds: %s",
-                            attempt + 1, wait_seconds, exc)
-                await asyncio.sleep(wait_seconds)
-    raise RuntimeError(f"LibreTranslate failed after 5 attempts: {last_error}") from last_error
 
 async def send_translated_message(message, source_key: str):
     post_key = f"{source_key}:{message.id}"
@@ -178,9 +164,9 @@ async def send_translated_message(message, source_key: str):
     translated = ""
     if original:
         try:
-            translated = await translate_text(original)
+            translated = extract_persian_text(original)
         except Exception:
-            log.exception("Translation failed for message %s", message.id)
+            log.exception("Persian text extraction failed for message %s", message.id)
             if TRANSLATE_REQUIRED:
                 return
             translated = original
@@ -221,7 +207,7 @@ async def send_translated_message(message, source_key: str):
                 await bot.send_message(TARGET_CHANNEL, chunk)
         seen_ids.add(post_key)
         save_seen()
-        log.info("Relayed message %s without source footer", message.id)
+        log.info("Relayed Persian-only message %s", message.id)
     except Exception:
         log.exception("Failed to relay message %s", message.id)
     finally:
@@ -249,9 +235,9 @@ async def send_translated_album(messages, source_key: str):
     translated = ""
     if original:
         try:
-            translated = await translate_text(original)
+            translated = extract_persian_text(original)
         except Exception:
-            log.exception("Album translation failed for %s", album_key)
+            log.exception("Persian text extraction failed for %s", album_key)
             if TRANSLATE_REQUIRED:
                 return
 
